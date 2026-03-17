@@ -6,9 +6,11 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
+from django.db import transaction
 from .models import Campaign, Contribution
 from .serializers import CampaignSerializer, CampaignDetailSerializer, ContributionSerializer
 from apps.core.permissions import IsCreatorOrReadOnly
+from apps.payments.models import Payment
 
 class CampaignViewSet(viewsets.ModelViewSet):
     queryset = Campaign.objects.all()
@@ -41,7 +43,8 @@ class CampaignViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(creator=self.request.user)
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    @transaction.atomic
     def contribute(self, request, pk=None):
         campaign = self.get_object()
         
@@ -67,24 +70,61 @@ class CampaignViewSet(viewsets.ModelViewSet):
         if serializer.is_valid():
             contribution = serializer.save(contributor=request.user, campaign=campaign)
             
-            # Initialize payment
+            # Generate unique references
+            contribution_ref = f"CONTRIB_{campaign.id}_{contribution.id}"
+            payment_ref = f"PAY_{contribution.id}_{campaign.id}"
+            
+            # Initialize payment with Paystack
             from apps.payments.services import PaystackService
             payment_service = PaystackService()
+            
+            # Set callback URL to your ngrok URL
+            callback_url = f"{request.build_absolute_uri('/').rstrip('/')}/api/payments/verify/"
+            
             payment_data = payment_service.initialize_payment(
                 email=request.user.email,
                 amount=contribution.amount,
-                reference=f"CONTRIB_{campaign.id}_{contribution.id}"
+                reference=contribution_ref,
+                metadata={
+                    'campaign_id': campaign.id,
+                    'contribution_id': contribution.id,
+                    'user_id': request.user.id,
+                    'callback_url': callback_url
+                }
             )
             
             if payment_data['status']:
+                # Update contribution with payment reference
                 contribution.payment_reference = payment_data['data']['reference']
                 contribution.save()
                 
+                # Create payment record in database
+                payment = Payment.objects.create(
+                    user=request.user,
+                    amount=contribution.amount,
+                    payment_type='contribution',
+                    status='pending',
+                    reference=payment_ref,
+                    paystack_reference=payment_data['data']['reference'],
+                    metadata={
+                        'campaign_id': campaign.id,
+                        'contribution_id': contribution.id,
+                        'authorization_url': payment_data['data']['authorization_url']
+                    }
+                )
+                
                 return Response({
                     'contribution': serializer.data,
-                    'payment': payment_data['data']
+                    'payment': {
+                        'authorization_url': payment_data['data']['authorization_url'],
+                        'access_code': payment_data['data']['access_code'],
+                        'reference': payment_data['data']['reference'],
+                        'payment_id': payment.id
+                    }
                 }, status=status.HTTP_201_CREATED)
             
+            # If payment initialization failed, delete the contribution
+            contribution.delete()
             return Response(
                 {'error': 'Failed to initialize payment'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

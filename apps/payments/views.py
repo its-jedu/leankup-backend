@@ -1,11 +1,8 @@
-from django.shortcuts import render
-
-# Create your views here.
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db import transaction
-from django.shortcuts import get_object_or_404
+from django.shortcuts import redirect
 from .models import Payment
 from .serializers import (
     PaymentSerializer, PaymentInitializeSerializer,
@@ -14,13 +11,12 @@ from .serializers import (
 from .services import PaystackService
 from apps.wallet.models import Wallet, Transaction
 from apps.fundraising.models import Campaign, Contribution
-from apps.outsourcing.models import Task
 import uuid
 
 class PaymentViewSet(viewsets.GenericViewSet):
     queryset = Payment.objects.all()
     serializer_class = PaymentSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]  # Default requires auth
     
     def get_queryset(self):
         return self.queryset.filter(user=self.request.user)
@@ -74,8 +70,65 @@ class PaymentViewSet(viewsets.GenericViewSet):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
     
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['get', 'post'], permission_classes=[permissions.AllowAny])
     def verify(self, request):
+        """
+        Handle Paystack redirect (GET) and manual verification (POST)
+        """
+        # Handle GET request from Paystack redirect
+        if request.method == 'GET':
+            reference = request.query_params.get('reference')
+            if not reference:
+                return Response(
+                    {'error': 'No reference provided'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Verify with Paystack
+            paystack_service = PaystackService()
+            result = paystack_service.verify_payment(reference)
+            
+            if result.get('status') and result['data']['status'] == 'success':
+                try:
+                    payment = Payment.objects.get(paystack_reference=reference)
+                    
+                    with transaction.atomic():
+                        # Update payment status
+                        payment.status = 'success'
+                        payment.save()
+                        
+                        # Credit user's wallet
+                        wallet, _ = Wallet.objects.get_or_create(user=payment.user)
+                        wallet.credit(payment.amount)
+                        
+                        # Create transaction record
+                        Transaction.objects.create(
+                            wallet=wallet,
+                            amount=payment.amount,
+                            transaction_type='credit',
+                            status='completed',
+                            reference=f"TX_{reference}",
+                            description=f"Payment via Paystack: {payment.payment_type}",
+                            metadata={'payment_reference': reference}
+                        )
+                        
+                        # Handle payment type specific logic
+                        if payment.payment_type == 'contribution':
+                            self._handle_contribution_payment(payment, reference)
+                    
+                    # Redirect to frontend success page
+                    return redirect(f"http://localhost:3000/payment/success?reference={reference}")
+                    
+                except Payment.DoesNotExist:
+                    return Response(
+                        {'error': 'Payment not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            
+            # Redirect to frontend failure page
+            return redirect(f"http://localhost:3000/payment/failed?reference={reference}")
+        
+        # Handle POST request for manual verification
         serializer = PaymentVerifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
@@ -116,9 +169,7 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 
                 # Handle payment type specific logic
                 if payment.payment_type == 'contribution':
-                    self._handle_contribution_payment(payment)
-                elif payment.payment_type == 'task_payment':
-                    self._handle_task_payment(payment)
+                    self._handle_contribution_payment(payment, reference)
             
             return Response({
                 'message': 'Payment verified successfully',
@@ -130,32 +181,29 @@ class PaymentViewSet(viewsets.GenericViewSet):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    def _handle_contribution_payment(self, payment):
+    def _handle_contribution_payment(self, payment, reference):
         """Handle contribution payment logic"""
         campaign_id = payment.metadata.get('campaign_id')
-        if campaign_id:
-            campaign = Campaign.objects.get(id=campaign_id)
-            
-            # Update contribution status
-            contribution = Contribution.objects.create(
-                campaign=campaign,
-                contributor=payment.user,
-                amount=payment.amount,
-                status='paid',
-                payment_reference=payment.reference,
-                message=payment.metadata.get('message', '')
-            )
-            
-            # Update campaign raised amount
-            campaign.raised_amount += payment.amount
-            campaign.save()
+        contribution_id = payment.metadata.get('contribution_id')
+        
+        if campaign_id and contribution_id:
+            try:
+                campaign = Campaign.objects.get(id=campaign_id)
+                contribution = Contribution.objects.get(id=contribution_id)
+                
+                # Update contribution status
+                contribution.status = 'paid'
+                contribution.payment_reference = reference
+                contribution.save()
+                
+                # Update campaign raised amount
+                campaign.raised_amount += payment.amount
+                campaign.save()
+                
+            except (Campaign.DoesNotExist, Contribution.DoesNotExist):
+                pass
     
-    def _handle_task_payment(self, payment):
-        """Handle task payment logic"""
-        # Implement task payment logic
-        pass
-    
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
     def webhook(self, request):
         """
         Paystack webhook handler
@@ -173,7 +221,7 @@ class PaymentViewSet(viewsets.GenericViewSet):
             reference = data.get('reference')
             
             try:
-                payment = Payment.objects.get(reference=reference)
+                payment = Payment.objects.get(paystack_reference=reference)
                 
                 with transaction.atomic():
                     payment.status = 'success'
@@ -183,26 +231,11 @@ class PaymentViewSet(viewsets.GenericViewSet):
                     wallet, _ = Wallet.objects.get_or_create(user=payment.user)
                     wallet.credit(payment.amount)
                     
-                    # Handle contribution if applicable
+                    # Handle contribution
                     if payment.payment_type == 'contribution':
-                        campaign_id = payment.metadata.get('campaign_id')
-                        if campaign_id:
-                            campaign = Campaign.objects.get(id=campaign_id)
-                            campaign.raised_amount += payment.amount
-                            campaign.save()
-                            
-                            Contribution.objects.update_or_create(
-                                payment_reference=reference,
-                                defaults={
-                                    'campaign': campaign,
-                                    'contributor': payment.user,
-                                    'amount': payment.amount,
-                                    'status': 'paid',
-                                    'message': payment.metadata.get('message', '')
-                                }
-                            )
+                        self._handle_contribution_payment(payment, reference)
                 
             except Payment.DoesNotExist:
-                logger.error(f"Payment not found for reference: {reference}")
+                pass
         
         return Response({'status': 'success'})
