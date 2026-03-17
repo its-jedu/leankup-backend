@@ -17,6 +17,7 @@ class TaskSerializer(serializers.ModelSerializer):
 class TaskDetailSerializer(serializers.ModelSerializer):
     creator = serializers.SerializerMethodField()
     applications = serializers.SerializerMethodField()
+    applications_count = serializers.SerializerMethodField()
     
     class Meta:
         model = Task
@@ -36,7 +37,11 @@ class TaskDetailSerializer(serializers.ModelSerializer):
         if request and (request.user == obj.creator or request.user.is_staff):
             applications = obj.applications.all()
             return ApplicationSerializer(applications, many=True, context=self.context).data
-        return None
+        # For non-creators, return empty list instead of null
+        return []
+    
+    def get_applications_count(self, obj):
+        return obj.applications.count()
 
 class ApplicationSerializer(serializers.ModelSerializer):
     applicant_username = serializers.ReadOnlyField(source='applicant.username')

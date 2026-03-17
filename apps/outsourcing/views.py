@@ -1,4 +1,5 @@
 from django.shortcuts import render
+from django.db import models  # Add this missing import
 
 # Create your views here.
 from rest_framework import viewsets, permissions, status, filters
@@ -35,7 +36,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(creator=self.request.user)
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def apply(self, request, pk=None):
         task = self.get_object()
         
@@ -43,6 +44,13 @@ class TaskViewSet(viewsets.ModelViewSet):
         if task.status != 'open':
             return Response(
                 {'error': 'This task is not accepting applications'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if user already applied
+        if Application.objects.filter(task=task, applicant=request.user).exists():
+            return Response(
+                {'error': 'You have already applied to this task'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
