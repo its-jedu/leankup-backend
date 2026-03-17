@@ -1,15 +1,20 @@
-from django.shortcuts import render
-
-# Create your views here.
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db import transaction
 from django.shortcuts import get_object_or_404
+from decimal import Decimal
+import json
 from .models import Wallet, Transaction
 from .serializers import WalletSerializer, TransactionSerializer, WithdrawalSerializer
 from apps.payments.services import PaystackService
 import uuid
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
 
 class WalletViewSet(viewsets.GenericViewSet):
     permission_classes = [permissions.IsAuthenticated]
@@ -64,37 +69,25 @@ class WalletViewSet(viewsets.GenericViewSet):
             
             # Create transaction record
             tx_ref = f"WITHDRAW_{uuid.uuid4().hex[:10].upper()}"
+            
+            # Convert Decimal to float for metadata
+            metadata = serializer.validated_data.copy()
+            metadata['amount'] = float(amount)
+            
             transaction_record = Transaction.objects.create(
                 wallet=wallet,
                 amount=amount,
                 transaction_type='debit',
-                status='pending',
+                status='completed',  # Change to completed for testing
                 reference=tx_ref,
                 description=f"Withdrawal to {serializer.validated_data['bank_account_name']}",
-                metadata=serializer.validated_data
+                metadata=metadata
             )
-            
-            # Initiate payout via Paystack (or Raenest)
-            payment_service = PaystackService()
-            payout_data = {
-                'amount': amount,
-                'bank_code': serializer.validated_data.get('bank_code', ''),
-                'bank_account': serializer.validated_data['bank_account_number'],
-                'bank_name': serializer.validated_data['bank_name'],
-                'account_name': serializer.validated_data['bank_account_name'],
-                'reference': tx_ref,
-            }
-            
-            # Call payment service (implement in payments app)
-            # result = payment_service.initiate_transfer(payout_data)
-            
-            # For now, simulate success
-            transaction_record.status = 'completed'
-            transaction_record.save()
             
             return Response({
                 'message': 'Withdrawal initiated successfully',
                 'reference': tx_ref,
                 'amount': str(amount),
-                'status': 'completed'
+                'status': 'completed',
+                'new_balance': str(wallet.balance)
             })

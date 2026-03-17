@@ -3,6 +3,7 @@ from django.db import models
 # Create your models here.
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator
+from decimal import Decimal
 
 class Campaign(models.Model):
     CATEGORY_CHOICES = [
@@ -34,6 +35,10 @@ class Campaign(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
+    # Escrow fields
+    escrow_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    is_withdrawn = models.BooleanField(default=False)
+    
     def __str__(self):
         return self.title
     
@@ -52,6 +57,27 @@ class Campaign(models.Model):
         if self.end_date > timezone.now():
             return (self.end_date - timezone.now()).days
         return 0
+    
+    def release_funds_to_creator(self, bank_details=None):
+        """
+        Release escrow funds to creator's bank account or Raenest
+        """
+        if self.status != 'completed':
+            return False, "Campaign must be completed to release funds"
+        
+        if self.is_withdrawn:
+            return False, "Funds already withdrawn from this campaign"
+        
+        if self.escrow_balance <= 0:
+            return False, "No funds in escrow to release"
+        
+        # Here you would integrate with Paystack/Raenest to send money to bank
+        # For now, we'll just mark as withdrawn
+        
+        self.is_withdrawn = True
+        self.save()
+        
+        return True, f"Successfully released {self.escrow_balance} from escrow"
 
 class Contribution(models.Model):
     STATUS_CHOICES = [
