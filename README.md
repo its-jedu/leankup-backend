@@ -440,23 +440,4 @@ python manage.py migrate
 
 ---
 
-## **Running in Production**
-
-When you're ready to deploy:
-
-1. **Set `DEBUG=False`** in `.env`
-2. **Update `ALLOWED_HOSTS`** with your domain
-3. **Use a production database** (not SQLite)
-4. **Set up SSL/HTTPS**
-5. **Use environment variables** for all secrets
-6. **Collect static files:**
-
-```bash
-python manage.py collectstatic
-```
-
-7. **Use Gunicorn/uWSGI** instead of `runserver`
-
----
-
-## 🎉 **You're All Set!**
+## **You're All Set!🎉**
