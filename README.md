@@ -1,4 +1,4 @@
-# **LeankUp Backend - Complete Setup Guide**
+# **LeankUp Backend | Complete Setup Guide**
 
 Welcome to the LeankUp backend! This guide will help you set up and run the backend server, even if you're new to Django.
 
