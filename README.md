@@ -1,23 +1,8 @@
-# 📚 **LeankUp Backend - Complete Setup Guide**
+# **LeankUp Backend - Complete Setup Guide**
 
 Welcome to the LeankUp backend! This guide will help you set up and run the backend server, even if you're new to Django.
 
-## 📋 **Table of Contents**
-
-- [What is LeankUp?](##what-is-leankup)
-- [Prerequisites](#prerequisites)
-- [Quick Start (5 minutes)](#quick-start-5-minutes)
-- [Detailed Setup Guide](#detailed-setup-guide)
-- [Understanding the Project Structure](#understanding-the-project-structure)
-- [API Endpoints Overview](#api-endpoints-overview)
-- [Testing with Postman](#testing-with-postman)
-- [Environment Variables](#environment-variables)
-- [Common Issues & Solutions](#common-issues--solutions)
-- [Need Help?](#need-help)
-
----
-
-## 🎯 **What is LeankUp?**
+## **What is LeankUp?**
 
 LeankUp is a platform that combines:
 
@@ -28,7 +13,7 @@ LeankUp is a platform that combines:
 
 ---
 
-## ✅ **Prerequisites**
+## **Prerequisites**
 
 Before starting, make sure you have these installed:
 
@@ -93,7 +78,7 @@ Your server is now running at **http://localhost:8000**! 🎉
 
 ---
 
-## 📝 **Detailed Setup Guide**
+## **Detailed Setup Guide**
 
 ### **Step 1: Get the Code**
 
@@ -219,7 +204,7 @@ Open your browser and visit:
 
 ---
 
-## 📁 **Understanding the Project Structure**
+## **Understanding the Project Structure**
 
 ```
 leankup-backend/
@@ -235,32 +220,32 @@ leankup-backend/
 │   └── wsgi.py/asgi.py      # Server configuration
 │
 └── apps/                     # All application modules
-    ├── auth/                 # 🔐 Authentication
+    ├── auth/                 # Authentication
     │   ├── views.py          # Login, register, logout
     │   ├── serializers.py    # Data validation
     │   └── urls.py           # Auth endpoints
     │
-    ├── users/                # 👤 User profiles
+    ├── users/                # User profiles
     │   ├── models.py         # Profile model
     │   ├── views.py          # Profile management
     │   └── urls.py
     │
-    ├── outsourcing/          # 📋 Tasks
+    ├── outsourcing/          # Tasks
     │   ├── models.py         # Task and Application models
     │   ├── views.py          # Task CRUD operations
     │   └── urls.py
     │
-    ├── fundraising/          # 🎯 Campaigns & Escrow
+    ├── fundraising/          # Campaigns & Escrow
     │   ├── models.py         # Campaign and Contribution models
     │   ├── views.py          # Campaign management, escrow
     │   └── urls.py
     │
-    ├── wallet/               # 💰 Wallet
+    ├── wallet/               # Wallet
     │   ├── models.py         # Wallet and Transaction models
     │   ├── views.py          # Balance, withdrawals
     │   └── urls.py
     │
-    └── payments/             # 💳 Paystack Integration
+    └── payments/             # Paystack Integration
         ├── services.py       # Paystack API calls
         ├── models.py         # Payment records
         ├── views.py          # Payment endpoints
@@ -269,7 +254,7 @@ leankup-backend/
 
 ---
 
-## 🌐 **API Endpoints Overview**
+## **API Endpoints Overview**
 
 Here are the main endpoints you'll use:
 
@@ -318,7 +303,7 @@ POST   /api/wallet/withdraw/   - Withdraw to bank
 
 ---
 
-## 🔧 **Testing with Postman**
+## **Testing with Postman**
 
 1. **Download Postman** from [postman.com](https://www.postman.com/downloads/)
 
@@ -372,7 +357,7 @@ POST   /api/wallet/withdraw/   - Withdraw to bank
 
 ---
 
-## 🔐 **Environment Variables Explained**
+## **Environment Variables Explained**
 
 | Variable               | Purpose                            | Example                              |
 | ---------------------- | ---------------------------------- | ------------------------------------ |
@@ -455,7 +440,7 @@ python manage.py migrate
 
 ---
 
-## 🚀 **Running in Production**
+## **Running in Production**
 
 When you're ready to deploy:
 
@@ -471,18 +456,6 @@ python manage.py collectstatic
 ```
 
 7. **Use Gunicorn/uWSGI** instead of `runserver`
-
----
-
-## 📞 **Need Help?**
-
-If you get stuck:
-
-1. **Check the error message** - It usually tells you what's wrong
-2. **Google the error** - Someone else has probably solved it
-3. **Check Django documentation** - [docs.djangoproject.com](https://docs.djangoproject.com/)
-4. **DRF documentation** - [www.django-rest-framework.org](https://www.django-rest-framework.org/)
-5. **PostgreSQL documentation** - [www.postgresql.org/docs](https://www.postgresql.org/docs/)
 
 ---
 
