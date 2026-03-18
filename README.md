@@ -130,7 +130,7 @@ pip install -r requirements.txt
 4. Create a user: Right-click on "Login/Group Roles" → "Create" → "Login/Group Role"
 5. Name it `leankup_user`, set password, and give it "Can login" privilege
 
-**Option B: Using Command Line**
+**Option B: Using Command Line (RECOMMENDED)**
 
 ```sql
 -- Open PostgreSQL prompt: psql -U postgres
