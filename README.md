@@ -4,7 +4,7 @@ Welcome to the LeankUp backend! This guide will help you set up and run the back
 
 ## 📋 **Table of Contents**
 
-- [What is LeankUp?](#what-is-leankup)
+- [What is LeankUp?](##what-is-leankup)
 - [Prerequisites](#prerequisites)
 - [Quick Start (5 minutes)](#quick-start-5-minutes)
 - [Detailed Setup Guide](#detailed-setup-guide)
@@ -48,13 +48,13 @@ Before starting, make sure you have these installed:
 
 ---
 
-## ⚡ **Quick Start (5 minutes)**
+## **Quick Start (5 minutes)**
 
 Open your terminal/command prompt and run these commands:
 
 ```bash
 # 1. Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/its-jedu/leankup-backend.git
 cd leankup-backend
 
 # 2. Create virtual environment
@@ -99,7 +99,7 @@ Your server is now running at **http://localhost:8000**! 🎉
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/leankup-backend.git
+git clone https://github.com/its-jedu/leankup-backend.git
 cd leankup-backend
 ```
 
@@ -216,7 +216,6 @@ Open your browser and visit:
 
 - **API Root**: http://localhost:8000/api/
 - **Admin Panel**: http://localhost:8000/admin/ (use admin credentials)
-- **API Docs**: http://localhost:8000/swagger/
 
 ---
 
@@ -488,13 +487,3 @@ If you get stuck:
 ---
 
 ## 🎉 **You're All Set!**
-
-You now have a fully functional LeankUp backend with:
-
-- ✅ User authentication
-- ✅ Task posting and bidding
-- ✅ Campaign fundraising with escrow
-- ✅ Wallet and payment processing
-- ✅ Admin dashboard
-
-**Happy coding!** 🚀
