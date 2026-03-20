@@ -1,6 +1,4 @@
 from django.shortcuts import render
-
-# Create your views here.
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -38,6 +36,12 @@ class RegistrationView(generics.CreateAPIView):
 class LoginView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
     permission_classes = [permissions.AllowAny]
+    
+    def post(self, request, *args, **kwargs):
+        # Pass the request to the serializer context
+        serializer = self.get_serializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
 class LogoutView(generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -73,4 +77,3 @@ class PasswordResetView(generics.GenericAPIView):
         )
         
         return Response({'message': 'Password reset email sent'}, status=status.HTTP_200_OK)
-

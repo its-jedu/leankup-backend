@@ -1,7 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
-from django.core import exceptions
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from phonenumber_field.serializerfields import PhoneNumberField
@@ -23,6 +22,10 @@ class RegistrationSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         if attrs['password'] != attrs['password2']:
             raise serializers.ValidationError({"password": "Password fields didn't match."})
+        
+        # Check if username already exists
+        if User.objects.filter(username=attrs['username']).exists():
+            raise serializers.ValidationError({"username": "A user with this username already exists."})
         
         # Check if email already exists
         if User.objects.filter(email=attrs['email']).exists():
@@ -52,33 +55,52 @@ class RegistrationSerializer(serializers.ModelSerializer):
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
-        credentials = {
-            'username': attrs.get('username'),
-            'password': attrs.get('password')
-        }
+        # Get the request from the context
+        request = self.context.get('request')
+        username_or_email = attrs.get('username')
+        password = attrs.get('password')
         
-        # Allow login with email
-        if '@' in credentials['username']:
+        # Determine if input is email or username
+        if '@' in username_or_email:
             try:
-                # Use filter() instead of get() to handle multiple users
-                users = User.objects.filter(email=credentials['username'])
-                if users.exists():
-                    if users.count() > 1:
-                        # If multiple users with same email, require username
-                        raise serializers.ValidationError({
-                            "username": "Multiple users found with this email. Please login with username instead."
-                        })
-                    credentials['username'] = users.first().username
-                else:
-                    raise serializers.ValidationError({
-                        "email": "No user found with this email."
-                    })
+                # Try to find user by email
+                user = User.objects.get(email=username_or_email)
+                username = user.username
             except User.DoesNotExist:
                 raise serializers.ValidationError({
-                    "email": "No user found with this email."
+                    "detail": "No active account found with the given credentials"
                 })
+        else:
+            username = username_or_email
         
-        return super().validate(credentials)
+        # Authenticate with username and pass the request for axes
+        user = authenticate(request=request, username=username, password=password)
+        
+        if not user:
+            raise serializers.ValidationError({
+                "detail": "No active account found with the given credentials"
+            })
+        
+        if not user.is_active:
+            raise serializers.ValidationError({
+                "detail": "This account is inactive"
+            })
+        
+        # Generate tokens
+        refresh = self.get_token(user)
+        data = {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+            }
+        }
+        
+        return data
 
 class PasswordResetSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)
