@@ -1,6 +1,4 @@
 from django.db import models
-
-# Create your models here.
 from django.contrib.auth.models import User
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -14,6 +12,19 @@ class Profile(models.Model):
     bank_account_number = models.CharField(max_length=20, blank=True, null=True)
     bank_name = models.CharField(max_length=100, blank=True, null=True)
     bank_code = models.CharField(max_length=10, blank=True, null=True)
+    
+    # Profile info
+    bio = models.TextField(blank=True, null=True)
+    location = models.CharField(max_length=255, blank=True, null=True)
+    avatar = models.ImageField(upload_to='avatars/', blank=True, null=True)
+    
+    # Stats
+    total_tasks_posted = models.IntegerField(default=0)
+    total_tasks_completed = models.IntegerField(default=0)
+    total_campaigns_created = models.IntegerField(default=0)
+    total_earned = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    response_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
