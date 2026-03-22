@@ -3,6 +3,7 @@ from django.contrib.auth.models import User
 from django.core.validators import MinLengthValidator, MinValueValidator
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+import secrets
 
 class Task(models.Model):
     CATEGORY_CHOICES = [
@@ -30,9 +31,17 @@ class Task(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    deleted_at = models.DateTimeField(blank=True, null=True)
+    completion_key = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    completed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='completed_tasks')
+    completed_at = models.DateTimeField(blank=True, null=True)
     
     def __str__(self):
         return self.title
+    
+    def generate_completion_key(self):
+        """Generate a unique completion key for the task"""
+        return secrets.token_urlsafe(32)
     
     class Meta:
         ordering = ['-created_at']
@@ -52,6 +61,10 @@ class Application(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    completed = models.BooleanField(default=False)
+    completed_at = models.DateTimeField(blank=True, null=True)
+    completion_key_used = models.CharField(max_length=100, blank=True, null=True)
+    escrow_released = models.BooleanField(default=False)
     
     def __str__(self):
         return f"{self.applicant.username} - {self.task.title}"
@@ -152,3 +165,15 @@ class TaskPaymentEscrow(models.Model):
     
     def __str__(self):
         return f"Escrow for {self.task.title} - {self.amount}"
+
+class EscrowRelease(models.Model):
+    """Track how escrow is distributed among multiple workers"""
+    escrow = models.ForeignKey(TaskPaymentEscrow, on_delete=models.CASCADE, related_name='releases')
+    wallet = models.ForeignKey('wallet_app.Wallet', on_delete=models.CASCADE)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    released_at = models.DateTimeField(auto_now_add=True)
+    completion_key_used = models.CharField(max_length=100)
+    completed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    
+    def __str__(self):
+        return f"Release for {self.escrow.task.title} - ₦{self.amount}"

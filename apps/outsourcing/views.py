@@ -1,4 +1,5 @@
 import uuid
+import secrets
 from django.shortcuts import render, redirect
 from django.db import models, transaction
 from rest_framework import viewsets, permissions, status, filters, generics
@@ -9,7 +10,7 @@ from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
 from django.utils import timezone
 from decimal import Decimal
-from .models import Task, Application, ChatMessage, Notification, TaskPaymentEscrow, PaymentProof
+from .models import Task, Application, ChatMessage, Notification, TaskPaymentEscrow, PaymentProof, EscrowRelease
 from .serializers import (
     TaskSerializer, TaskDetailSerializer, ApplicationSerializer, 
     ChatMessageSerializer, NotificationSerializer, PaymentProofSerializer, PaymentProofVerifySerializer,
@@ -19,8 +20,6 @@ from apps.users.models import Profile
 from apps.users.serializers import ProfileSerializer
 from apps.core.permissions import IsCreatorOrReadOnly
 from apps.wallet.models import Wallet, Transaction
-from apps.payments.models import Payment
-from apps.payments.services import PaystackService
 
 
 class TaskViewSet(viewsets.ModelViewSet):
@@ -38,7 +37,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         return TaskSerializer
     
     def get_queryset(self):
-        queryset = Task.objects.all()
+        queryset = Task.objects.filter(deleted_at__isnull=True)
         user_tasks = self.request.query_params.get('user_tasks', None)
         if user_tasks and self.request.user.is_authenticated:
             queryset = queryset.filter(creator=self.request.user)
@@ -57,7 +56,6 @@ class TaskViewSet(viewsets.ModelViewSet):
         
         # Check if user has sufficient balance
         if wallet.balance < budget:
-            # Return response with payment requirement
             return Response({
                 'error': 'Insufficient wallet balance',
                 'requires_payment': True,
@@ -68,10 +66,15 @@ class TaskViewSet(viewsets.ModelViewSet):
                 'task_data': serializer.validated_data
             }, status=status.HTTP_402_PAYMENT_REQUIRED)
         
-        # Sufficient balance - create task and escrow
         with transaction.atomic():
+            # Generate completion key
+            completion_key = secrets.token_urlsafe(32)
+            
             # Create the task
-            task = serializer.save(creator=request.user)
+            task = serializer.save(
+                creator=request.user,
+                completion_key=completion_key
+            )
             
             # Debit wallet
             wallet.debit(budget)
@@ -86,7 +89,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                 funded_at=timezone.now()
             )
             
-            # Create transaction record for the debit
+            # Create transaction record
             Transaction.objects.create(
                 wallet=wallet,
                 amount=budget,
@@ -98,23 +101,24 @@ class TaskViewSet(viewsets.ModelViewSet):
                     'task_id': task.id,
                     'task_title': task.title,
                     'escrow_id': escrow.id,
+                    'completion_key': completion_key,
                     'type': 'escrow_creation'
                 }
             )
             
-            # Create notification for task creator
+            # Create notification
             Notification.objects.create(
                 recipient=request.user,
                 notification_type='task_completed',
                 title='Task Created with Escrow',
-                message=f'Your task "{task.title}" has been created. ₦{budget:,.2f} has been moved to escrow and will be held until task completion.',
+                message=f'Your task "{task.title}" has been created. ₦{budget:,.2f} has been moved to escrow. Keep your completion key safe: {completion_key[:8]}...',
                 task=task
             )
         
-        # Return success response with escrow info
         return Response({
-            'message': 'Task created successfully with escrow funding',
+            'message': 'Task created successfully',
             'task': TaskSerializer(task).data,
+            'completion_key': completion_key,
             'escrow': {
                 'id': escrow.id,
                 'amount': str(escrow.amount),
@@ -125,18 +129,286 @@ class TaskViewSet(viewsets.ModelViewSet):
         }, status=status.HTTP_201_CREATED)
     
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
-    def apply(self, request, pk=None):
+    def delete_task(self, request, pk=None):
+        """Soft delete a task - only if no accepted applications or not in progress"""
         task = self.get_object()
+        
+        if request.user != task.creator:
+            return Response(
+                {'error': 'Only the task creator can delete this task'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Check if task can be deleted
+        if task.status == 'in_progress':
+            return Response(
+                {'error': 'Cannot delete a task that is in progress'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if there are accepted applications
+        accepted_apps = task.applications.filter(status='accepted')
+        if accepted_apps.exists():
+            return Response(
+                {'error': 'Cannot delete a task with accepted applications'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        with transaction.atomic():
+            # Soft delete the task
+            task.deleted_at = timezone.now()
+            task.status = 'cancelled'
+            task.save()
+            
+            # If escrow exists and is funded, refund to poster
+            if hasattr(task, 'escrow') and task.escrow.status == 'funded':
+                escrow = task.escrow
+                poster_wallet = escrow.poster_wallet
+                poster_wallet.credit(escrow.amount)
+                
+                Transaction.objects.create(
+                    wallet=poster_wallet,
+                    amount=escrow.amount,
+                    transaction_type='credit',
+                    status='completed',
+                    reference=f"ESCROW_REFUND_DELETE_{task.id}_{uuid.uuid4().hex[:8].upper()}",
+                    description=f"Escrow refund for deleted task: {task.title}",
+                    metadata={
+                        'task_id': task.id,
+                        'task_title': task.title,
+                        'escrow_id': escrow.id,
+                        'type': 'escrow_refund'
+                    }
+                )
+                
+                escrow.status = 'refunded'
+                escrow.save()
+                
+                Notification.objects.create(
+                    recipient=request.user,
+                    notification_type='task_completed',
+                    title='Task Deleted - Escrow Refunded',
+                    message=f'Your task "{task.title}" has been deleted. ₦{escrow.amount:,.2f} has been refunded to your wallet.',
+                    task=task
+                )
+        
+        return Response({
+            'message': 'Task deleted successfully',
+            'refunded': str(escrow.amount) if hasattr(task, 'escrow') else None
+        }, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def complete_task(self, request, pk=None):
+        """Mark a task as completed using the completion key"""
+        task = self.get_object()
+        completion_key = request.data.get('completion_key')
+        user_id = request.data.get('user_id')
+        
+        if not completion_key:
+            return Response(
+                {'error': 'Completion key is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify completion key
+        if task.completion_key != completion_key:
+            return Response(
+                {'error': 'Invalid completion key'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Determine who is marking complete
+        user = None
+        if user_id:
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response(
+                    {'error': 'User not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            user = request.user
+        
+        # Check if user is authorized (poster or accepted applicant)
+        is_poster = task.creator == user
+        accepted_app = task.applications.filter(applicant=user, status='accepted').first()
+        
+        if not is_poster and not accepted_app:
+            return Response(
+                {'error': 'You are not authorized to complete this task'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if task.status == 'completed':
+            return Response(
+                {'error': 'Task is already completed'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        with transaction.atomic():
+            task.status = 'completed'
+            task.completed_by = user
+            task.completed_at = timezone.now()
+            task.save()
+            
+            # Mark all accepted applications as completed
+            accepted_apps = task.applications.filter(status='accepted')
+            for app in accepted_apps:
+                app.completed = True
+                app.completed_at = timezone.now()
+                app.completion_key_used = completion_key
+                app.save()
+            
+            # Create notification for the other party
+            if is_poster:
+                for app in accepted_apps:
+                    Notification.objects.create(
+                        recipient=app.applicant,
+                        sender=user,
+                        notification_type='task_completed',
+                        title='Task Completed by Poster',
+                        message=f'The poster has marked task "{task.title}" as completed.',
+                        task=task
+                    )
+            else:
+                Notification.objects.create(
+                    recipient=task.creator,
+                    sender=user,
+                    notification_type='task_completed',
+                    title='Task Completed by Worker',
+                    message=f'{user.username} has marked task "{task.title}" as completed.',
+                    task=task
+                )
+        
+        return Response({
+            'message': 'Task marked as completed',
+            'task_status': task.status,
+            'completed_by': user.username
+        }, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def release_escrow(self, request, pk=None):
+        """Release escrow to accepted applicants after task completion"""
+        task = self.get_object()
+        
+        if request.user != task.creator:
+            return Response(
+                {'error': 'Only the task creator can release escrow'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if task.status != 'completed':
+            return Response(
+                {'error': 'Task must be completed before releasing escrow'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not hasattr(task, 'escrow'):
+            return Response(
+                {'error': 'No escrow found for this task'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        escrow = task.escrow
+        
+        if escrow.status != 'funded':
+            return Response(
+                {'error': f'Cannot release escrow. Status: {escrow.status}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get all accepted applicants
+        accepted_apps = task.applications.filter(status='accepted')
+        
+        if not accepted_apps.exists():
+            return Response(
+                {'error': 'No accepted applicants found'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Calculate amount per worker (equal distribution)
+        amount_per_worker = escrow.amount / len(accepted_apps)
+        
+        with transaction.atomic():
+            for app in accepted_apps:
+                worker_wallet, _ = Wallet.objects.get_or_create(user=app.applicant)
+                
+                # Credit worker's wallet
+                worker_wallet.credit(amount_per_worker)
+                
+                # Create transaction record
+                tx_ref = f"ESCROW_RELEASE_{task.id}_{app.id}_{uuid.uuid4().hex[:8].upper()}"
+                Transaction.objects.create(
+                    wallet=worker_wallet,
+                    amount=amount_per_worker,
+                    transaction_type='credit',
+                    status='completed',
+                    reference=tx_ref,
+                    description=f"Payment for task: {task.title}",
+                    metadata={
+                        'task_id': task.id,
+                        'task_title': task.title,
+                        'escrow_id': escrow.id,
+                        'application_id': app.id,
+                        'type': 'escrow_release'
+                    }
+                )
+                
+                # Create EscrowRelease record
+                EscrowRelease.objects.create(
+                    escrow=escrow,
+                    wallet=worker_wallet,
+                    amount=amount_per_worker,
+                    completion_key_used=app.completion_key_used or task.completion_key,
+                    completed_by=app.applicant
+                )
+                
+                app.escrow_released = True
+                app.save()
+                
+                # Create notification for worker
+                Notification.objects.create(
+                    recipient=app.applicant,
+                    sender=request.user,
+                    notification_type='payment_released',
+                    title='Payment Released',
+                    message=f'Payment of ₦{amount_per_worker:,.2f} has been released for task: {task.title}',
+                    task=task
+                )
+                
+                # Update user stats
+                app.applicant.profile.total_earned += amount_per_worker
+                app.applicant.profile.total_tasks_completed += 1
+                app.applicant.profile.save()
+            
+            # Update escrow status
+            escrow.status = 'released'
+            escrow.released_at = timezone.now()
+            escrow.save()
+        
+        return Response({
+            'message': f'Escrow released to {len(accepted_apps)} worker(s)',
+            'amount_per_worker': str(amount_per_worker),
+            'total_workers': len(accepted_apps),
+            'escrow_status': escrow.status
+        }, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def apply(self, request, pk=None):
+        """Apply for a task - prevent duplicate applications"""
+        task = self.get_object()
+        
+        # Check if user has already applied
+        if Application.objects.filter(task=task, applicant=request.user).exists():
+            return Response(
+                {'error': 'You have already applied to this task', 'already_applied': True},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
         if task.status != 'open':
             return Response(
                 {'error': 'This task is not accepting applications'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if Application.objects.filter(task=task, applicant=request.user).exists():
-            return Response(
-                {'error': 'You have already applied to this task'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
@@ -152,19 +424,20 @@ class TaskViewSet(viewsets.ModelViewSet):
             Notification.objects.create(
                 recipient=task.creator,
                 sender=request.user,
-                task=task,
-                application=application,
                 notification_type='application',
                 title=f'New Application for "{task.title}"',
-                message=f'{request.user.username} has applied for your task.'
+                message=f'{request.user.username} has applied for your task. Click to view their profile and application.',
+                task=task,
+                application=application
             )
             
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.IsAuthenticated])
     def applications(self, request, pk=None):
+        """Get applications for a task with applicant profiles"""
         task = self.get_object()
         
         if request.user != task.creator and not request.user.is_staff:
@@ -174,8 +447,73 @@ class TaskViewSet(viewsets.ModelViewSet):
             )
         
         applications = task.applications.all()
-        serializer = ApplicationSerializer(applications, many=True, context={'request': request})
-        return Response(serializer.data)
+        
+        # Add profile data to each application
+        result = []
+        for app in applications:
+            app_data = ApplicationSerializer(app).data
+            profile = Profile.objects.get(user=app.applicant)
+            app_data['applicant_profile'] = ProfileSerializer(profile).data
+            app_data['applicant_stats'] = {
+                'total_completed_tasks': profile.total_tasks_completed,
+                'total_earned': str(profile.total_earned),
+                'response_rate': profile.response_rate
+            }
+            result.append(app_data)
+        
+        return Response(result)
+    
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def accept_applications(self, request, pk=None):
+        """Accept multiple applications for a task"""
+        task = self.get_object()
+        
+        if request.user != task.creator:
+            return Response(
+                {'error': 'Only the task creator can accept applications'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        application_ids = request.data.get('application_ids', [])
+        
+        if not application_ids:
+            return Response(
+                {'error': 'No application IDs provided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        with transaction.atomic():
+            accepted_count = 0
+            for app_id in application_ids:
+                try:
+                    app = Application.objects.get(id=app_id, task=task)
+                    if app.status == 'pending':
+                        app.status = 'accepted'
+                        app.save()
+                        accepted_count += 1
+                        
+                        # Create notification for applicant
+                        Notification.objects.create(
+                            recipient=app.applicant,
+                            sender=request.user,
+                            notification_type='application_accepted',
+                            title=f'Application Accepted for "{task.title}"',
+                            message=f'{request.user.username} has accepted your application for task: {task.title}',
+                            task=task,
+                            application=app
+                        )
+                except Application.DoesNotExist:
+                    continue
+            
+            # Update task status if at least one application accepted
+            if accepted_count > 0:
+                task.status = 'in_progress'
+                task.save()
+        
+        return Response({
+            'message': f'Accepted {accepted_count} application(s)',
+            'accepted_count': accepted_count
+        }, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'], url_path='my-applications')
     def my_applications(self, request):
@@ -282,300 +620,15 @@ class TaskViewSet(viewsets.ModelViewSet):
         Notification.objects.create(
             recipient=receiver,
             sender=request.user,
-            task=task,
             notification_type='message',
             title=f'New Message about "{task.title}"',
-            message=f'{request.user.username} sent you a message: {content[:100]}...'
+            message=f'{request.user.username} sent you a message: {content[:100]}...',
+            task=task
         )
         
         serializer = ChatMessageSerializer(message)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
-    @transaction.atomic
-    def fund_escrow(self, request, pk=None):
-        """
-        Fund the escrow for a task from poster's wallet
-        """
-        task = self.get_object()
-        
-        # Check if user is the task creator
-        if request.user != task.creator:
-            return Response(
-                {'error': 'Only the task creator can fund the escrow'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        # Check if task is still open
-        if task.status != 'open':
-            return Response(
-                {'error': f'Task is not open for funding. Current status: {task.status}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Check if escrow already exists and is funded
-        if hasattr(task, 'escrow') and task.escrow.status == 'funded':
-            return Response(
-                {'error': 'Escrow is already funded for this task'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Validate amount
-        serializer = TaskPaymentInitiateSerializer(
-            data=request.data,
-            context={'task': task}
-        )
-        serializer.is_valid(raise_exception=True)
-        
-        amount = serializer.validated_data['amount']
-        
-        # Get poster's wallet
-        poster_wallet, _ = Wallet.objects.get_or_create(user=request.user)
-        
-        # Check if poster has sufficient balance
-        if poster_wallet.balance < amount:
-            return Response(
-                {'error': f'Insufficient wallet balance. Current balance: ₦{poster_wallet.balance:,.2f}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        with transaction.atomic():
-            # Create or update escrow
-            escrow, created = TaskPaymentEscrow.objects.get_or_create(
-                task=task,
-                defaults={
-                    'amount': amount,
-                    'poster_wallet': poster_wallet,
-                    'worker_wallet': None,
-                    'status': 'pending',
-                }
-            )
-            
-            if not created:
-                escrow.amount = amount
-                escrow.status = 'pending'
-                escrow.save()
-            
-            # Debit poster's wallet
-            poster_wallet.debit(amount)
-            
-            # Create transaction record
-            Transaction.objects.create(
-                wallet=poster_wallet,
-                amount=amount,
-                transaction_type='debit',
-                status='completed',
-                reference=f"ESCROW_FUND_{task.id}_{uuid.uuid4().hex[:8].upper()}",
-                description=f"Escrow funding for task: {task.title}",
-                metadata={
-                    'task_id': task.id,
-                    'task_title': task.title,
-                    'escrow_id': escrow.id,
-                    'type': 'escrow_funding'
-                }
-            )
-            
-            # Mark escrow as funded
-            escrow.status = 'funded'
-            escrow.funded_at = timezone.now()
-            escrow.save()
-            
-            # Create notification for the task creator
-            Notification.objects.create(
-                recipient=request.user,
-                notification_type='escrow_funded',
-                title='Escrow Funded',
-                message=f'You have successfully funded ₦{amount:,.2f} into escrow for task: {task.title}',
-                task=task
-            )
-            
-            return Response({
-                'message': 'Escrow funded successfully',
-                'escrow': {
-                    'id': escrow.id,
-                    'amount': str(escrow.amount),
-                    'status': escrow.status,
-                    'funded_at': escrow.funded_at
-                },
-                'wallet_balance': str(poster_wallet.balance)
-            }, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
-    @transaction.atomic
-    def release_payment(self, request, pk=None):
-        """
-        Release escrow payment to the worker after task completion
-        """
-        task = self.get_object()
-        
-        # Check if user is the task creator
-        if request.user != task.creator:
-            return Response(
-                {'error': 'Only the task creator can release payment'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        # Check if escrow exists and is funded
-        if not hasattr(task, 'escrow'):
-            return Response(
-                {'error': 'No escrow found for this task'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        escrow = task.escrow
-        
-        if escrow.status != 'funded':
-            return Response(
-                {'error': f'Cannot release payment. Escrow status: {escrow.status}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Check if task is completed
-        if task.status != 'completed':
-            return Response(
-                {'error': 'Task must be marked as completed before releasing payment'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Get accepted applicant
-        accepted_app = task.applications.filter(status='accepted').first()
-        if not accepted_app:
-            return Response(
-                {'error': 'No accepted applicant found for this task'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        worker = accepted_app.applicant
-        
-        with transaction.atomic():
-            # Get or create worker's wallet
-            worker_wallet, _ = Wallet.objects.get_or_create(user=worker)
-            escrow.worker_wallet = worker_wallet
-            
-            # Credit worker's wallet
-            worker_wallet.credit(escrow.amount)
-            
-            # Create transaction record for worker
-            Transaction.objects.create(
-                wallet=worker_wallet,
-                amount=escrow.amount,
-                transaction_type='credit',
-                status='completed',
-                reference=f"ESCROW_RELEASE_{task.id}_{uuid.uuid4().hex[:8].upper()}",
-                description=f"Payment received for task: {task.title}",
-                metadata={
-                    'task_id': task.id,
-                    'task_title': task.title,
-                    'escrow_id': escrow.id,
-                    'type': 'escrow_release'
-                }
-            )
-            
-            # Update escrow status
-            escrow.status = 'released'
-            escrow.released_at = timezone.now()
-            escrow.save()
-            
-            # Create notification for worker
-            Notification.objects.create(
-                recipient=worker,
-                notification_type='payment_released',
-                title='Payment Released',
-                message=f'Payment of ₦{escrow.amount:,.2f} has been released for task: {task.title}',
-                task=task
-            )
-            
-            # Update user stats
-            worker.profile.total_earned += escrow.amount
-            worker.profile.total_tasks_completed += 1
-            worker.profile.save()
-            
-            return Response({
-                'message': 'Payment released successfully',
-                'amount': str(escrow.amount),
-                'recipient': worker.username,
-                'task_status': task.status,
-                'escrow_status': escrow.status
-            }, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
-    @transaction.atomic
-    def refund_payment(self, request, pk=None):
-        """
-        Refund escrow payment back to poster (if task is cancelled)
-        """
-        task = self.get_object()
-        
-        # Check if user is the task creator
-        if request.user != task.creator:
-            return Response(
-                {'error': 'Only the task creator can request refund'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        # Check if escrow exists
-        if not hasattr(task, 'escrow'):
-            return Response(
-                {'error': 'No escrow found for this task'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        escrow = task.escrow
-        
-        # Can only refund if task is cancelled
-        if task.status != 'cancelled':
-            return Response(
-                {'error': 'Task must be cancelled to request refund'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if escrow.status != 'funded':
-            return Response(
-                {'error': f'Cannot refund. Escrow status: {escrow.status}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        with transaction.atomic():
-            # Credit poster's wallet
-            poster_wallet = escrow.poster_wallet
-            poster_wallet.credit(escrow.amount)
-            
-            # Create transaction record
-            Transaction.objects.create(
-                wallet=poster_wallet,
-                amount=escrow.amount,
-                transaction_type='credit',
-                status='completed',
-                reference=f"ESCROW_REFUND_{task.id}_{uuid.uuid4().hex[:8].upper()}",
-                description=f"Escrow refund for cancelled task: {task.title}",
-                metadata={
-                    'task_id': task.id,
-                    'task_title': task.title,
-                    'escrow_id': escrow.id,
-                    'type': 'escrow_refund'
-                }
-            )
-            
-            # Update escrow status
-            escrow.status = 'refunded'
-            escrow.save()
-            
-            # Create notification
-            Notification.objects.create(
-                recipient=request.user,
-                notification_type='task_completed',
-                title='Escrow Refunded',
-                message=f'₦{escrow.amount:,.2f} has been refunded to your wallet for task: {task.title}',
-                task=task
-            )
-            
-            return Response({
-                'message': 'Escrow refunded successfully',
-                'amount': str(escrow.amount),
-                'wallet_balance': str(poster_wallet.balance),
-                'escrow_status': escrow.status
-            }, status=status.HTTP_200_OK)
-
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def upload_payment_proof(self, request, pk=None):
         """
@@ -642,10 +695,10 @@ class TaskViewSet(viewsets.ModelViewSet):
             Notification.objects.create(
                 recipient=payment_proof.receiver,
                 sender=request.user,
-                task=task,
                 notification_type='payment_proof',
                 title='Payment Proof Uploaded',
-                message=f'{request.user.username} has uploaded a payment proof for task: {task.title}'
+                message=f'{request.user.username} has uploaded a payment proof for task: {task.title}',
+                task=task
             )
             
             return Response({
@@ -751,10 +804,10 @@ class TaskViewSet(viewsets.ModelViewSet):
             Notification.objects.create(
                 recipient=payment_proof.sender,
                 sender=request.user,
-                task=task,
                 notification_type='payment_verified',
                 title=f'Payment Proof {status_text.title()}',
-                message=f'Your payment proof for task: {task.title} has been {status_text}. {notes}'
+                message=f'Your payment proof for task: {task.title} has been {status_text}. {notes}',
+                task=task
             )
             
             return Response({
@@ -791,7 +844,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         serializer = PaymentProofSerializer(payment_proofs, many=True, context={'request': request})
         
         return Response(serializer.data)
-
+    
     @action(detail=True, methods=['get'], permission_classes=[permissions.IsAuthenticated])
     def escrow_info(self, request, pk=None):
         """
@@ -827,7 +880,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         }
         
         return Response(data)
-
+    
     @action(detail=True, methods=['post'])
     def accept(self, request, pk=None):
         application = self.get_object()
@@ -858,11 +911,11 @@ class TaskViewSet(viewsets.ModelViewSet):
         Notification.objects.create(
             recipient=application.applicant,
             sender=request.user,
-            task=application.task,
-            application=application,
             notification_type='application_accepted',
             title=f'Your application for "{application.task.title}" was accepted!',
-            message=f'{request.user.username} has accepted your application. You can now start working on the task.'
+            message=f'{request.user.username} has accepted your application. You can now start working on the task.',
+            task=application.task,
+            application=application
         )
         
         return Response({'message': 'Application accepted'})
@@ -880,6 +933,47 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         return Application.objects.filter(
             models.Q(applicant=user) | models.Q(task__creator=user)
         ).distinct()
+    
+    @action(detail=True, methods=['get'])
+    def profile_summary(self, request, pk=None):
+        """Get applicant profile summary for poster"""
+        application = self.get_object()
+        
+        # Check if user is task creator
+        if request.user != application.task.creator:
+            return Response(
+                {'error': 'Only the task creator can view applicant profiles'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        profile = Profile.objects.get(user=application.applicant)
+        data = {
+            'user': {
+                'id': application.applicant.id,
+                'username': application.applicant.username,
+                'first_name': application.applicant.first_name,
+                'last_name': application.applicant.last_name,
+                'email': application.applicant.email,
+                'date_joined': application.applicant.date_joined,
+            },
+            'profile': ProfileSerializer(profile).data,
+            'application': {
+                'id': application.id,
+                'message': application.message,
+                'portfolio_link': application.portfolio_link,
+                'proposed_budget': application.proposed_budget,
+                'created_at': application.created_at,
+            },
+            'stats': {
+                'total_completed_tasks': profile.total_tasks_completed,
+                'total_earned': str(profile.total_earned),
+                'response_rate': profile.response_rate,
+                'total_tasks_posted': profile.total_tasks_posted,
+                'total_campaigns_created': profile.total_campaigns_created,
+            }
+        }
+        
+        return Response(data)
     
     @action(detail=True, methods=['post'])
     def accept(self, request, pk=None):
@@ -903,11 +997,11 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         Notification.objects.create(
             recipient=application.applicant,
             sender=request.user,
-            task=application.task,
-            application=application,
             notification_type='application_accepted',
             title=f'Your application for "{application.task.title}" was accepted!',
-            message=f'{request.user.username} has accepted your application. You can now start chatting about the task details.'
+            message=f'{request.user.username} has accepted your application. You can now start chatting about the task details.',
+            task=application.task,
+            application=application
         )
         
         return Response({'message': 'Application accepted'})
@@ -929,11 +1023,11 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         Notification.objects.create(
             recipient=application.applicant,
             sender=request.user,
-            task=application.task,
-            application=application,
             notification_type='application_rejected',
             title=f'Application for "{application.task.title}" was not selected',
-            message=f'Thank you for your interest. The task creator has chosen another applicant.'
+            message=f'Thank you for your interest. The task creator has chosen another applicant.',
+            task=application.task,
+            application=application
         )
         
         return Response({'message': 'Application rejected'})
@@ -945,6 +1039,19 @@ class NotificationViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         return Notification.objects.filter(recipient=self.request.user)
+    
+    @action(detail=False, methods=['get'])
+    def recent(self, request):
+        """Get top 5 latest notifications"""
+        notifications = self.get_queryset()[:5]
+        serializer = self.get_serializer(notifications, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def unread_count(self, request):
+        """Get count of unread notifications"""
+        count = self.get_queryset().filter(is_read=False).count()
+        return Response({'unread_count': count})
     
     @action(detail=False, methods=['post'])
     def mark_all_read(self, request):
