@@ -5,9 +5,10 @@ from apps.fundraising.models import Contribution
 
 class PaymentInitializeSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(1)])
-    payment_type = serializers.ChoiceField(choices=['contribution', 'task_payment'])
+    payment_type = serializers.ChoiceField(choices=['contribution', 'task_payment', 'wallet_funding'])
     campaign_id = serializers.IntegerField(required=False)
     task_id = serializers.IntegerField(required=False)
+    metadata = serializers.JSONField(required=False, default=dict)
     
     def validate(self, data):
         if data['payment_type'] == 'contribution' and not data.get('campaign_id'):

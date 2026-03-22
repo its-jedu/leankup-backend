@@ -1,6 +1,4 @@
 from django.db import models
-
-# Create your models here.
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator
 
@@ -8,6 +6,7 @@ class Payment(models.Model):
     PAYMENT_TYPES = [
         ('contribution', 'Contribution'),
         ('task_payment', 'Task Payment'),
+        ('wallet_funding', 'Wallet Funding'),
         ('withdrawal', 'Withdrawal'),
     ]
     

@@ -65,7 +65,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                 'current_balance': str(wallet.balance),
                 'shortfall': str(budget - wallet.balance),
                 'message': f'You need ₦{budget:,.2f} to post this task. Your current balance is ₦{wallet.balance:,.2f}. Please fund your wallet to continue.',
-                'payment_redirect': '/wallet/fund'
+                'task_data': serializer.validated_data
             }, status=status.HTTP_402_PAYMENT_REQUIRED)
         
         # Sufficient balance - create task and escrow
@@ -123,200 +123,6 @@ class TaskViewSet(viewsets.ModelViewSet):
             },
             'wallet_balance': str(wallet.balance)
         }, status=status.HTTP_201_CREATED)
-    
-    @action(detail=False, methods=['post'], permission_classes=[permissions.IsAuthenticated])
-    def create_with_payment(self, request):
-        """
-        Create task after wallet funding - used when user initially had insufficient funds
-        """
-        budget = Decimal(str(request.data.get('budget', 0)))
-        
-        if budget <= 0:
-            return Response(
-                {'error': 'Invalid budget amount'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Generate unique reference for payment
-        payment_ref = f"TASK_FUND_{request.user.id}_{uuid.uuid4().hex[:8].upper()}"
-        
-        # Initialize payment with Paystack
-        payment_service = PaystackService()
-        
-        # Store task data temporarily
-        task_data = {
-            'title': request.data.get('title'),
-            'description': request.data.get('description'),
-            'category': request.data.get('category'),
-            'location': request.data.get('location'),
-            'budget': str(budget),
-            'creator_id': request.user.id
-        }
-        
-        # Initialize payment
-        callback_url = f"{request.build_absolute_uri('/').rstrip('/')}/api/tasks/payment-callback/"
-        
-        payment_result = payment_service.initialize_payment(
-            email=request.user.email,
-            amount=budget,
-            reference=payment_ref,
-            metadata={
-                'type': 'task_creation',
-                'task_data': task_data,
-                'user_id': request.user.id,
-                'callback_url': callback_url
-            }
-        )
-        
-        if payment_result.get('status'):
-            # Create a pending payment record
-            payment = Payment.objects.create(
-                user=request.user,
-                amount=budget,
-                payment_type='task_payment',
-                status='pending',
-                reference=payment_ref,
-                paystack_reference=payment_result['data']['reference'],
-                metadata={'task_data': task_data}
-            )
-            
-            return Response({
-                'requires_payment': True,
-                'payment': {
-                    'authorization_url': payment_result['data']['authorization_url'],
-                    'access_code': payment_result['data']['access_code'],
-                    'reference': payment_result['data']['reference'],
-                    'payment_id': payment.id
-                },
-                'task_data': task_data,
-                'message': 'Please complete payment to create your task'
-            }, status=status.HTTP_200_OK)
-        
-        return Response(
-            {'error': 'Failed to initialize payment'},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-    
-    @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
-    def payment_callback(self, request):
-        """
-        Handle payment callback from Paystack after task creation payment
-        """
-        from apps.payments.services import PaystackService
-        from apps.payments.models import Payment
-        
-        reference = request.data.get('reference') or request.query_params.get('reference')
-        
-        if not reference:
-            return Response(
-                {'error': 'No reference provided'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Verify payment
-        payment_service = PaystackService()
-        verification = payment_service.verify_payment(reference)
-        
-        if verification.get('status') and verification['data']['status'] == 'success':
-            try:
-                payment = Payment.objects.get(paystack_reference=reference)
-                
-                with transaction.atomic():
-                    # Update payment status
-                    payment.status = 'success'
-                    payment.save()
-                    
-                    # Get task data from metadata
-                    task_data = payment.metadata.get('task_data', {})
-                    user = payment.user
-                    
-                    # Get or create wallet
-                    wallet, _ = Wallet.objects.get_or_create(user=user)
-                    
-                    # Credit wallet with the payment amount
-                    wallet.credit(payment.amount)
-                    
-                    # Create transaction record for credit
-                    Transaction.objects.create(
-                        wallet=wallet,
-                        amount=payment.amount,
-                        transaction_type='credit',
-                        status='completed',
-                        reference=f"TASK_FUND_{reference}",
-                        description=f"Wallet funding for task creation",
-                        metadata={
-                            'payment_reference': reference,
-                            'type': 'task_funding'
-                        }
-                    )
-                    
-                    # Now create the task with escrow
-                    task = Task.objects.create(
-                        title=task_data.get('title'),
-                        description=task_data.get('description'),
-                        category=task_data.get('category'),
-                        location=task_data.get('location'),
-                        budget=Decimal(str(task_data.get('budget'))),
-                        creator=user,
-                        status='open'
-                    )
-                    
-                    # Debit wallet for escrow
-                    wallet.debit(task.budget)
-                    
-                    # Create escrow record
-                    escrow = TaskPaymentEscrow.objects.create(
-                        task=task,
-                        amount=task.budget,
-                        poster_wallet=wallet,
-                        worker_wallet=None,
-                        status='funded',
-                        funded_at=timezone.now()
-                    )
-                    
-                    # Create transaction record for escrow debit
-                    Transaction.objects.create(
-                        wallet=wallet,
-                        amount=task.budget,
-                        transaction_type='debit',
-                        status='completed',
-                        reference=f"ESCROW_TASK_{task.id}_{uuid.uuid4().hex[:8].upper()}",
-                        description=f"Escrow created for task: {task.title}",
-                        metadata={
-                            'task_id': task.id,
-                            'task_title': task.title,
-                            'escrow_id': escrow.id,
-                            'type': 'escrow_creation'
-                        }
-                    )
-                    
-                    # Create notification
-                    Notification.objects.create(
-                        recipient=user,
-                        notification_type='task_completed',
-                        title='Task Created Successfully',
-                        message=f'Your task "{task.title}" has been created. ₦{task.budget:,.2f} has been moved to escrow.',
-                        task=task
-                    )
-                    
-                    # Return success response
-                    return Response({
-                        'success': True,
-                        'task_id': task.id,
-                        'message': 'Task created successfully'
-                    }, status=status.HTTP_200_OK)
-                    
-            except Payment.DoesNotExist:
-                return Response(
-                    {'error': 'Payment not found'},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-        
-        # Payment failed
-        return Response(
-            {'error': 'Payment verification failed'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
     
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def apply(self, request, pk=None):
@@ -716,7 +522,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         
         escrow = task.escrow
         
-        # Can only refund if task is cancelled or no worker accepted
+        # Can only refund if task is cancelled
         if task.status != 'cancelled':
             return Response(
                 {'error': 'Task must be cancelled to request refund'},
@@ -1022,7 +828,6 @@ class TaskViewSet(viewsets.ModelViewSet):
         
         return Response(data)
 
-    # Update the accept action to set worker wallet in escrow
     @action(detail=True, methods=['post'])
     def accept(self, request, pk=None):
         application = self.get_object()

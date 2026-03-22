@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class PaymentViewSet(viewsets.GenericViewSet):
     queryset = Payment.objects.all()
     serializer_class = PaymentSerializer
-    permission_classes = [permissions.IsAuthenticated]  # Default requires auth
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         return self.queryset.filter(user=self.request.user)
@@ -34,28 +34,32 @@ class PaymentViewSet(viewsets.GenericViewSet):
         serializer = PaymentInitializeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        payment_type = serializer.validated_data['payment_type']
+        amount = serializer.validated_data['amount']
+        
         # Generate reference
         reference = f"PAY_{uuid.uuid4().hex[:10].upper()}"
 
         # Create payment record
         payment = Payment.objects.create(
             user=request.user,
-            amount=serializer.validated_data['amount'],
-            payment_type=serializer.validated_data['payment_type'],
+            amount=amount,
+            payment_type=payment_type,
             reference=reference,
-            metadata=serializer.validated_data
+            metadata=serializer.validated_data.get('metadata', {})
         )
 
         # Initialize Paystack payment
         paystack_service = PaystackService()
         result = paystack_service.initialize_payment(
             email=request.user.email,
-            amount=serializer.validated_data['amount'],
+            amount=amount,
             reference=reference,
             metadata={
                 'payment_id': payment.id,
                 'user_id': request.user.id,
-                **serializer.validated_data
+                'payment_type': payment_type,
+                **serializer.validated_data.get('metadata', {})
             }
         )
 
@@ -101,6 +105,18 @@ class PaymentViewSet(viewsets.GenericViewSet):
                     payment = Payment.objects.get(paystack_reference=reference)
 
                     with transaction.atomic():
+                        # Check if payment is already processed
+                        if payment.status == 'success':
+                            logger.info(f"Payment {reference} already processed")
+                            # Redirect based on payment type
+                            if payment.payment_type == 'task_payment':
+                                return redirect(f"http://localhost:3000/tasks/create?payment=success&reference={reference}")
+                            elif payment.payment_type == 'wallet_funding':
+                                return_url = payment.metadata.get('return_url', '/wallet')
+                                return redirect(f"http://localhost:3000{return_url}?payment=success&reference={reference}")
+                            else:
+                                return redirect(f"http://localhost:3000/payment/success?reference={reference}")
+                        
                         # Update payment status
                         payment.status = 'success'
                         payment.save()
@@ -110,18 +126,21 @@ class PaymentViewSet(viewsets.GenericViewSet):
                             self._handle_contribution_payment(payment, reference)
                         elif payment.payment_type == 'task_payment':
                             self._handle_task_payment(payment, reference)
+                        elif payment.payment_type == 'wallet_funding':
+                            self._handle_wallet_funding(payment, reference)
                         else:
-                            # Only credit wallet for other payments
+                            # Credit wallet for other payments
                             wallet, _ = Wallet.objects.get_or_create(user=payment.user)
                             wallet.credit(payment.amount)
 
-                            # Create transaction record
+                            # Create transaction record with unique reference
+                            tx_ref = f"TX_{reference}_{uuid.uuid4().hex[:8]}"
                             Transaction.objects.create(
                                 wallet=wallet,
                                 amount=payment.amount,
                                 transaction_type='credit',
                                 status='completed',
-                                reference=f"TX_{reference}",
+                                reference=tx_ref,
                                 description=f"Payment via Paystack: {payment.payment_type}",
                                 metadata={'payment_reference': reference}
                             )
@@ -129,6 +148,9 @@ class PaymentViewSet(viewsets.GenericViewSet):
                     # Redirect based on payment type
                     if payment.payment_type == 'task_payment':
                         return redirect(f"http://localhost:3000/tasks/create?payment=success&reference={reference}")
+                    elif payment.payment_type == 'wallet_funding':
+                        return_url = payment.metadata.get('return_url', '/wallet')
+                        return redirect(f"http://localhost:3000{return_url}?payment=success&reference={reference}")
                     else:
                         return redirect(f"http://localhost:3000/payment/success?reference={reference}")
 
@@ -155,6 +177,13 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        # Check if already processed
+        if payment.status == 'success':
+            return Response({
+                'message': 'Payment already verified',
+                'payment': PaymentSerializer(payment).data
+            })
+
         # Verify with Paystack
         paystack_service = PaystackService()
         result = paystack_service.verify_payment(reference)
@@ -170,18 +199,21 @@ class PaymentViewSet(viewsets.GenericViewSet):
                     self._handle_contribution_payment(payment, reference)
                 elif payment.payment_type == 'task_payment':
                     self._handle_task_payment(payment, reference)
+                elif payment.payment_type == 'wallet_funding':
+                    self._handle_wallet_funding(payment, reference)
                 else:
-                    # Only credit wallet for other payments
+                    # Credit wallet for other payments
                     wallet, _ = Wallet.objects.get_or_create(user=payment.user)
                     wallet.credit(payment.amount)
 
-                    # Create transaction record
+                    # Create transaction record with unique reference
+                    tx_ref = f"TX_{reference}_{uuid.uuid4().hex[:8]}"
                     Transaction.objects.create(
                         wallet=wallet,
                         amount=payment.amount,
                         transaction_type='credit',
                         status='completed',
-                        reference=f"TX_{reference}",
+                        reference=tx_ref,
                         description=f"Payment via Paystack: {payment.payment_type}",
                         metadata={'payment_reference': reference}
                     )
@@ -199,7 +231,6 @@ class PaymentViewSet(viewsets.GenericViewSet):
     def _handle_contribution_payment(self, payment, reference):
         """
         Handle contribution payment logic with escrow
-        Money goes to campaign escrow, NOT to contributor's wallet
         """
         campaign_id = payment.metadata.get('campaign_id')
         message = payment.metadata.get('message', '')
@@ -222,17 +253,18 @@ class PaymentViewSet(viewsets.GenericViewSet):
 
                 # Update campaign raised amount AND escrow balance
                 campaign.raised_amount += payment.amount
-                campaign.escrow_balance += payment.amount  # Add to escrow
+                campaign.escrow_balance += payment.amount
                 campaign.save()
 
-                # Create a transaction record for the contributor (for their records)
+                # Create transaction record with unique reference
                 wallet, _ = Wallet.objects.get_or_create(user=payment.user)
+                tx_ref = f"CONTRIB_{reference}_{uuid.uuid4().hex[:8]}"
                 Transaction.objects.create(
                     wallet=wallet,
                     amount=payment.amount,
-                    transaction_type='debit',  # It's a debit from their perspective
+                    transaction_type='debit',
                     status='completed',
-                    reference=f"CONTRIB_{reference}",
+                    reference=tx_ref,
                     description=f"Contribution to campaign: {campaign.title}",
                     metadata={
                         'payment_reference': reference,
@@ -266,13 +298,14 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 # Credit wallet with the payment amount
                 wallet.credit(payment.amount)
                 
-                # Create transaction record for credit
+                # Create transaction record for credit with unique reference
+                credit_ref = f"TASK_FUND_{reference}_{uuid.uuid4().hex[:8]}"
                 Transaction.objects.create(
                     wallet=wallet,
                     amount=payment.amount,
                     transaction_type='credit',
                     status='completed',
-                    reference=f"TASK_FUND_{reference}",
+                    reference=credit_ref,
                     description=f"Wallet funding for task creation",
                     metadata={
                         'payment_reference': reference,
@@ -304,13 +337,14 @@ class PaymentViewSet(viewsets.GenericViewSet):
                     funded_at=timezone.now()
                 )
                 
-                # Create transaction record for escrow debit
+                # Create transaction record for escrow debit with unique reference
+                escrow_ref = f"ESCROW_TASK_{task.id}_{uuid.uuid4().hex[:8]}"
                 Transaction.objects.create(
                     wallet=wallet,
                     amount=task.budget,
                     transaction_type='debit',
                     status='completed',
-                    reference=f"ESCROW_TASK_{task.id}_{uuid.uuid4().hex[:8].upper()}",
+                    reference=escrow_ref,
                     description=f"Escrow created for task: {task.title}",
                     metadata={
                         'task_id': task.id,
@@ -333,6 +367,50 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 
         except Exception as e:
             logger.error(f"Error handling task creation payment: {str(e)}")
+            raise
+
+    def _handle_wallet_funding(self, payment, reference):
+        """
+        Handle wallet funding payment - check if already processed
+        """
+        try:
+            with transaction.atomic():
+                # Get or create wallet
+                wallet, _ = Wallet.objects.get_or_create(user=payment.user)
+                
+                # Check if this transaction was already processed
+                existing_tx = Transaction.objects.filter(
+                    metadata__payment_reference=reference,
+                    transaction_type='credit'
+                ).exists()
+                
+                if existing_tx:
+                    logger.info(f"Wallet funding {reference} already processed, skipping")
+                    return
+                
+                # Credit wallet
+                wallet.credit(payment.amount)
+                
+                # Create transaction record with unique reference
+                tx_ref = f"WALLET_FUND_{reference}_{uuid.uuid4().hex[:8]}"
+                Transaction.objects.create(
+                    wallet=wallet,
+                    amount=payment.amount,
+                    transaction_type='credit',
+                    status='completed',
+                    reference=tx_ref,
+                    description=f"Wallet funding via Paystack",
+                    metadata={
+                        'payment_reference': reference,
+                        'type': 'wallet_funding',
+                        'payment_id': payment.id
+                    }
+                )
+                
+                logger.info(f"Wallet funded for user {payment.user.id} with amount {payment.amount}")
+                
+        except Exception as e:
+            logger.error(f"Error handling wallet funding: {str(e)}")
             raise
 
     @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
@@ -369,17 +447,20 @@ class PaymentViewSet(viewsets.GenericViewSet):
                             self._handle_contribution_payment(payment, reference)
                         elif payment.payment_type == 'task_payment':
                             self._handle_task_payment(payment, reference)
+                        elif payment.payment_type == 'wallet_funding':
+                            self._handle_wallet_funding(payment, reference)
                         else:
                             # Credit wallet for other payments
                             wallet, _ = Wallet.objects.get_or_create(user=payment.user)
                             wallet.credit(payment.amount)
 
+                            tx_ref = f"TX_{reference}_{uuid.uuid4().hex[:8]}"
                             Transaction.objects.create(
                                 wallet=wallet,
                                 amount=payment.amount,
                                 transaction_type='credit',
                                 status='completed',
-                                reference=f"TX_{reference}",
+                                reference=tx_ref,
                                 description=f"Payment via Paystack: {payment.payment_type}",
                                 metadata={'payment_reference': reference}
                             )
