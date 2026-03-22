@@ -1,6 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.core.validators import MinLengthValidator
+from django.core.validators import MinLengthValidator, MinValueValidator
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
@@ -82,6 +82,10 @@ class Notification(models.Model):
         ('application_rejected', 'Application Rejected'),
         ('task_completed', 'Task Completed'),
         ('message', 'New Message'),
+        ('payment_proof', 'Payment Proof Uploaded'),
+        ('payment_verified', 'Payment Verified'),
+        ('escrow_funded', 'Escrow Funded'),
+        ('payment_released', 'Payment Released'),
     ]
     
     recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
@@ -99,3 +103,52 @@ class Notification(models.Model):
     
     def __str__(self):
         return f"{self.title} for {self.recipient.username}"
+
+class PaymentProof(models.Model):
+    """Picture proof of payment for tasks"""
+    STATUS_CHOICES = [
+        ('pending', 'Pending Verification'),
+        ('verified', 'Verified'),
+        ('rejected', 'Rejected'),
+    ]
+    
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name='payment_proofs')
+    sender = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_payment_proofs')
+    receiver = models.ForeignKey(User, on_delete=models.CASCADE, related_name='received_payment_proofs')
+    image = models.ImageField(upload_to='payment_proofs/%Y/%m/%d/')
+    caption = models.TextField(blank=True, null=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    verified_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"Payment proof for {self.task.title} - {self.amount}"
+
+class TaskPaymentEscrow(models.Model):
+    """Escrow system for task payments"""
+    STATUS_CHOICES = [
+        ('pending', 'Pending Payment'),
+        ('funded', 'Funded'),
+        ('released', 'Released to Worker'),
+        ('refunded', 'Refunded to Poster'),
+        ('disputed', 'Under Dispute'),
+    ]
+    
+    task = models.OneToOneField(Task, on_delete=models.CASCADE, related_name='escrow')
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
+    poster_wallet = models.ForeignKey('wallet_app.Wallet', on_delete=models.CASCADE, related_name='poster_escrows')
+    worker_wallet = models.ForeignKey('wallet_app.Wallet', on_delete=models.CASCADE, related_name='worker_escrows', null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    payment_proof = models.ForeignKey(PaymentProof, on_delete=models.SET_NULL, null=True, blank=True)
+    funded_at = models.DateTimeField(blank=True, null=True)
+    released_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"Escrow for {self.task.title} - {self.amount}"

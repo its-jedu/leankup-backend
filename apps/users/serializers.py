@@ -14,7 +14,7 @@ class ProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = Profile
         fields = (
-            'id', 'user', 'phone_number', 'raenest_account_id', 
+            'id', 'user', 'phone_number', 'whatsapp_number', 'raenest_account_id', 
             'bank_account_name', 'bank_account_number', 'bank_name',
             'bank_code', 'bio', 'location', 'avatar',
             'total_tasks_posted', 'total_tasks_completed', 
@@ -30,7 +30,7 @@ class ProfileSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         # Only allow updating certain fields
         allowed_fields = [
-            'phone_number', 'raenest_account_id', 
+            'phone_number', 'whatsapp_number', 'raenest_account_id', 
             'bank_account_name', 'bank_account_number', 
             'bank_name', 'bank_code', 'bio', 'location', 'avatar'
         ]

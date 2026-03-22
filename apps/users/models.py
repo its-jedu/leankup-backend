@@ -7,6 +7,7 @@ from phonenumber_field.modelfields import PhoneNumberField
 class Profile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     phone_number = PhoneNumberField(blank=True, null=True)
+    whatsapp_number = PhoneNumberField(blank=True, null=True)  # Add this field
     raenest_account_id = models.CharField(max_length=100, blank=True, null=True)
     bank_account_name = models.CharField(max_length=200, blank=True, null=True)
     bank_account_number = models.CharField(max_length=20, blank=True, null=True)

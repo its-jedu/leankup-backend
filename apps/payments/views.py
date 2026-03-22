@@ -4,6 +4,10 @@ from rest_framework.response import Response
 from django.db import transaction
 from django.shortcuts import redirect
 from decimal import Decimal
+import uuid
+import logging
+from django.utils import timezone
+
 from .models import Payment
 from .serializers import (
     PaymentSerializer, PaymentInitializeSerializer,
@@ -12,7 +16,9 @@ from .serializers import (
 from .services import PaystackService
 from apps.wallet.models import Wallet, Transaction
 from apps.fundraising.models import Campaign, Contribution
-import uuid
+
+
+logger = logging.getLogger(__name__)
 
 
 class PaymentViewSet(viewsets.GenericViewSet):
@@ -102,8 +108,10 @@ class PaymentViewSet(viewsets.GenericViewSet):
                         # Handle payment type specific logic
                         if payment.payment_type == 'contribution':
                             self._handle_contribution_payment(payment, reference)
+                        elif payment.payment_type == 'task_payment':
+                            self._handle_task_payment(payment, reference)
                         else:
-                            # Only credit wallet for non-contribution payments
+                            # Only credit wallet for other payments
                             wallet, _ = Wallet.objects.get_or_create(user=payment.user)
                             wallet.credit(payment.amount)
 
@@ -118,8 +126,11 @@ class PaymentViewSet(viewsets.GenericViewSet):
                                 metadata={'payment_reference': reference}
                             )
 
-                    # Redirect to frontend success page
-                    return redirect(f"http://localhost:3000/payment/success?reference={reference}")
+                    # Redirect based on payment type
+                    if payment.payment_type == 'task_payment':
+                        return redirect(f"http://localhost:3000/tasks/create?payment=success&reference={reference}")
+                    else:
+                        return redirect(f"http://localhost:3000/payment/success?reference={reference}")
 
                 except Payment.DoesNotExist:
                     return Response(
@@ -157,8 +168,10 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 # Handle payment type specific logic
                 if payment.payment_type == 'contribution':
                     self._handle_contribution_payment(payment, reference)
+                elif payment.payment_type == 'task_payment':
+                    self._handle_task_payment(payment, reference)
                 else:
-                    # Only credit wallet for non-contribution payments
+                    # Only credit wallet for other payments
                     wallet, _ = Wallet.objects.get_or_create(user=payment.user)
                     wallet.credit(payment.amount)
 
@@ -230,9 +243,97 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 )
 
             except Campaign.DoesNotExist:
-                # Log error but don't fail the payment
-                import logging
-                logging.error(f"Campaign {campaign_id} not found for payment {reference}")
+                logger.error(f"Campaign {campaign_id} not found for payment {reference}")
+
+    def _handle_task_payment(self, payment, reference):
+        """
+        Handle task creation payment - credits wallet and creates task
+        """
+        from apps.outsourcing.models import Task, TaskPaymentEscrow, Notification
+        from decimal import Decimal
+        import uuid
+        from django.utils import timezone
+        
+        try:
+            with transaction.atomic():
+                # Get task data from metadata
+                task_data = payment.metadata.get('task_data', {})
+                user = payment.user
+                
+                # Get or create wallet
+                wallet, _ = Wallet.objects.get_or_create(user=user)
+                
+                # Credit wallet with the payment amount
+                wallet.credit(payment.amount)
+                
+                # Create transaction record for credit
+                Transaction.objects.create(
+                    wallet=wallet,
+                    amount=payment.amount,
+                    transaction_type='credit',
+                    status='completed',
+                    reference=f"TASK_FUND_{reference}",
+                    description=f"Wallet funding for task creation",
+                    metadata={
+                        'payment_reference': reference,
+                        'type': 'task_funding'
+                    }
+                )
+                
+                # Create the task
+                task = Task.objects.create(
+                    title=task_data.get('title'),
+                    description=task_data.get('description'),
+                    category=task_data.get('category'),
+                    location=task_data.get('location'),
+                    budget=Decimal(str(task_data.get('budget'))),
+                    creator=user,
+                    status='open'
+                )
+                
+                # Debit wallet for escrow
+                wallet.debit(task.budget)
+                
+                # Create escrow record
+                escrow = TaskPaymentEscrow.objects.create(
+                    task=task,
+                    amount=task.budget,
+                    poster_wallet=wallet,
+                    worker_wallet=None,
+                    status='funded',
+                    funded_at=timezone.now()
+                )
+                
+                # Create transaction record for escrow debit
+                Transaction.objects.create(
+                    wallet=wallet,
+                    amount=task.budget,
+                    transaction_type='debit',
+                    status='completed',
+                    reference=f"ESCROW_TASK_{task.id}_{uuid.uuid4().hex[:8].upper()}",
+                    description=f"Escrow created for task: {task.title}",
+                    metadata={
+                        'task_id': task.id,
+                        'task_title': task.title,
+                        'escrow_id': escrow.id,
+                        'type': 'escrow_creation'
+                    }
+                )
+                
+                # Create notification
+                Notification.objects.create(
+                    recipient=user,
+                    notification_type='task_completed',
+                    title='Task Created Successfully',
+                    message=f'Your task "{task.title}" has been created. ₦{task.budget:,.2f} has been moved to escrow.',
+                    task=task
+                )
+                
+                logger.info(f"Task {task.id} created successfully from payment {reference}")
+                
+        except Exception as e:
+            logger.error(f"Error handling task creation payment: {str(e)}")
+            raise
 
     @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
     def webhook(self, request):
@@ -243,10 +344,13 @@ class PaymentViewSet(viewsets.GenericViewSet):
 
         # Verify webhook signature
         if not paystack_service.verify_webhook_signature(request):
+            logger.warning("Invalid webhook signature received")
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
         event = request.data.get('event')
         data = request.data.get('data')
+
+        logger.info(f"Webhook received: {event} - {data.get('reference')}")
 
         if event == 'charge.success':
             reference = data.get('reference')
@@ -255,30 +359,108 @@ class PaymentViewSet(viewsets.GenericViewSet):
                 payment = Payment.objects.get(paystack_reference=reference)
 
                 with transaction.atomic():
-                    payment.status = 'success'
-                    payment.save()
+                    # Only process if payment is still pending
+                    if payment.status == 'pending':
+                        payment.status = 'success'
+                        payment.save()
 
-                    # Handle contribution with escrow
-                    if payment.payment_type == 'contribution':
-                        self._handle_contribution_payment(payment, reference)
+                        # Handle payment type specific logic
+                        if payment.payment_type == 'contribution':
+                            self._handle_contribution_payment(payment, reference)
+                        elif payment.payment_type == 'task_payment':
+                            self._handle_task_payment(payment, reference)
+                        else:
+                            # Credit wallet for other payments
+                            wallet, _ = Wallet.objects.get_or_create(user=payment.user)
+                            wallet.credit(payment.amount)
+
+                            Transaction.objects.create(
+                                wallet=wallet,
+                                amount=payment.amount,
+                                transaction_type='credit',
+                                status='completed',
+                                reference=f"TX_{reference}",
+                                description=f"Payment via Paystack: {payment.payment_type}",
+                                metadata={'payment_reference': reference}
+                            )
+                        
+                        logger.info(f"Payment {reference} processed successfully via webhook")
                     else:
-                        # Credit wallet for non-contribution payments
-                        wallet, _ = Wallet.objects.get_or_create(user=payment.user)
-                        wallet.credit(payment.amount)
-
-                        Transaction.objects.create(
-                            wallet=wallet,
-                            amount=payment.amount,
-                            transaction_type='credit',
-                            status='completed',
-                            reference=f"TX_{reference}",
-                            description=f"Payment via Paystack: {payment.payment_type}",
-                            metadata={'payment_reference': reference}
-                        )
+                        logger.info(f"Payment {reference} already processed, status: {payment.status}")
 
             except Payment.DoesNotExist:
-                # Log but don't fail
-                import logging
-                logging.error(f"Payment {reference} not found in webhook")
+                logger.error(f"Payment {reference} not found in webhook")
+                # Don't fail the webhook - return 200 to prevent retries
+                return Response({'status': 'success'})
 
         return Response({'status': 'success'})
+
+    @action(detail=False, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def fund_wallet(self, request):
+        """
+        Fund wallet through Paystack
+        """
+        amount = request.data.get('amount')
+        
+        if not amount:
+            return Response(
+                {'error': 'Amount is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            amount = Decimal(str(amount))
+            if amount <= 0:
+                raise ValueError
+        except:
+            return Response(
+                {'error': 'Invalid amount'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Generate reference
+        reference = f"WALLET_FUND_{request.user.id}_{uuid.uuid4().hex[:8].upper()}"
+        
+        # Create payment record
+        payment = Payment.objects.create(
+            user=request.user,
+            amount=amount,
+            payment_type='wallet_funding',
+            reference=reference,
+            metadata={
+                'type': 'wallet_funding',
+                'amount': str(amount)
+            }
+        )
+        
+        # Initialize Paystack payment
+        paystack_service = PaystackService()
+        result = paystack_service.initialize_payment(
+            email=request.user.email,
+            amount=amount,
+            reference=reference,
+            metadata={
+                'payment_id': payment.id,
+                'user_id': request.user.id,
+                'type': 'wallet_funding'
+            }
+        )
+        
+        if result.get('status'):
+            payment.paystack_reference = result['data']['reference']
+            payment.save()
+            
+            return Response({
+                'payment': PaymentSerializer(payment).data,
+                'authorization_url': result['data']['authorization_url'],
+                'access_code': result['data']['access_code'],
+                'reference': result['data']['reference']
+            })
+        
+        payment.status = 'failed'
+        payment.save()
+        
+        return Response(
+            {'error': 'Failed to initialize payment'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
