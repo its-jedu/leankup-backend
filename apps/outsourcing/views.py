@@ -14,7 +14,7 @@ from .models import Task, Application, ChatMessage, Notification, TaskPaymentEsc
 from .serializers import (
     TaskSerializer, TaskDetailSerializer, ApplicationSerializer, 
     ChatMessageSerializer, NotificationSerializer, PaymentProofSerializer, PaymentProofVerifySerializer,
-    TaskPaymentInitiateSerializer, EscrowStatusSerializer
+    TaskPaymentInitiateSerializer, EscrowStatusSerializer, GenerateCompletionKeySerializer
 )
 from apps.users.models import Profile
 from apps.users.serializers import ProfileSerializer
@@ -43,13 +43,37 @@ class TaskViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(creator=self.request.user)
         return queryset
     
+    @action(detail=False, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def generate_completion_key(self, request):
+        """Generate a random completion key for the poster to use"""
+        key_length = request.data.get('length', 16)
+        try:
+            key_length = int(key_length)
+            if key_length < 8:
+                key_length = 8
+            if key_length > 32:
+                key_length = 32
+        except:
+            key_length = 16
+        
+        # Generate a user-friendly random key
+        import string
+        alphabet = string.ascii_letters + string.digits
+        key = ''.join(secrets.choice(alphabet) for _ in range(key_length))
+        
+        return Response({
+            'completion_key': key,
+            'message': 'Copy this key and share it with the worker when the task is done.'
+        })
+    
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        """Custom create method with automatic escrow creation"""
+        """Custom create method with automatic escrow creation and custom completion key"""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         budget = serializer.validated_data.get('budget')
+        custom_key = serializer.validated_data.get('completion_key')
         
         # Get or create user's wallet
         wallet, created = Wallet.objects.get_or_create(user=request.user)
@@ -67,8 +91,19 @@ class TaskViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_402_PAYMENT_REQUIRED)
         
         with transaction.atomic():
-            # Generate completion key
-            completion_key = secrets.token_urlsafe(32)
+            # Use custom key if provided, otherwise generate one
+            if custom_key:
+                # Check if key is already in use (case-insensitive)
+                if Task.objects.filter(completion_key__iexact=custom_key).exists():
+                    return Response({
+                        'error': 'This completion key is already in use. Please choose another one.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                completion_key = custom_key
+            else:
+                # Generate a random key
+                import string
+                alphabet = string.ascii_letters + string.digits
+                completion_key = ''.join(secrets.choice(alphabet) for _ in range(16))
             
             # Create the task
             task = serializer.save(
@@ -106,12 +141,12 @@ class TaskViewSet(viewsets.ModelViewSet):
                 }
             )
             
-            # Create notification
+            # Create notification with completion key
             Notification.objects.create(
                 recipient=request.user,
                 notification_type='escrow_funded',
                 title='Task Created with Escrow',
-                message=f'Your task "{task.title}" has been created. ₦{budget:,.2f} has been moved to escrow. Keep your completion key safe: {completion_key}',
+                message=f'Your task "{task.title}" has been created. ₦{budget:,.2f} has been moved to escrow.\n\nCompletion Key: "{completion_key}"\n\nShare this key with the worker when the task is done. The worker will use it to mark the task as complete.',
                 task=task
             )
         
@@ -213,8 +248,8 @@ class TaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Verify completion key
-        if task.completion_key != completion_key:
+        # Verify completion key (case-insensitive)
+        if task.completion_key.lower() != completion_key.lower():
             return Response(
                 {'error': 'Invalid completion key'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -280,7 +315,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                     task=task,
                     notification_type='task_completed',
                     title='Task Marked Complete by Worker',
-                    message=f'{user.username} has marked task "{task.title}" as complete. Please confirm to release escrow.'
+                    message=f'{user.username} has marked task "{task.title}" as complete using the completion key. Please confirm to release escrow.'
                 )
             
             # Check if both parties have now completed

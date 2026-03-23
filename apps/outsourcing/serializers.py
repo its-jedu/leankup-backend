@@ -17,14 +17,22 @@ class ProfileSerializer(serializers.ModelSerializer):
 class TaskSerializer(serializers.ModelSerializer):
     creator_username = serializers.ReadOnlyField(source='creator.username')
     applications_count = serializers.SerializerMethodField()
+    completion_key = serializers.CharField(write_only=True, required=False, allow_blank=True)
     
     class Meta:
         model = Task
         fields = '__all__'
-        read_only_fields = ['creator', 'created_at', 'updated_at']
+        read_only_fields = ['creator', 'created_at', 'updated_at', 'completion_key']
     
     def get_applications_count(self, obj):
         return obj.applications.count()
+    
+    def validate_completion_key(self, value):
+        if value and len(value) < 3:
+            raise serializers.ValidationError("Completion key must be at least 3 characters")
+        if value and not value.replace('_', '').replace('-', '').isalnum():
+            raise serializers.ValidationError("Completion key can only contain letters, numbers, underscores, and hyphens")
+        return value
 
 class TaskDetailSerializer(serializers.ModelSerializer):
     creator = serializers.SerializerMethodField()
@@ -205,3 +213,6 @@ class EscrowStatusSerializer(serializers.ModelSerializer):
         model = TaskPaymentEscrow
         fields = '__all__'
 
+class GenerateCompletionKeySerializer(serializers.Serializer):
+    """Serializer for generating a random completion key"""
+    pass
