@@ -33,8 +33,16 @@ class Task(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     deleted_at = models.DateTimeField(blank=True, null=True)
     completion_key = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    
+    # Track who completed the task
     completed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='completed_tasks')
     completed_at = models.DateTimeField(blank=True, null=True)
+    
+    # BYbit-style dual confirmation fields
+    completed_by_poster = models.BooleanField(default=False, help_text="Has the task poster marked this task as complete?")
+    completed_by_worker = models.BooleanField(default=False, help_text="Has the worker marked this task as complete?")
+    poster_completed_at = models.DateTimeField(blank=True, null=True, help_text="When did the poster mark completion?")
+    worker_completed_at = models.DateTimeField(blank=True, null=True, help_text="When did the worker mark completion?")
     
     def __str__(self):
         return self.title
@@ -43,8 +51,17 @@ class Task(models.Model):
         """Generate a unique completion key for the task"""
         return secrets.token_urlsafe(32)
     
+    def is_fully_completed(self):
+        """Check if both parties have confirmed completion"""
+        return self.completed_by_poster and self.completed_by_worker
+    
+    def can_complete(self):
+        """Check if the task can be marked as complete"""
+        return self.status == 'in_progress' and not self.is_fully_completed()
+    
     class Meta:
         ordering = ['-created_at']
+
 
 class Application(models.Model):
     STATUS_CHOICES = [
@@ -61,6 +78,8 @@ class Application(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    
+    # Completion tracking
     completed = models.BooleanField(default=False)
     completed_at = models.DateTimeField(blank=True, null=True)
     completion_key_used = models.CharField(max_length=100, blank=True, null=True)
@@ -72,6 +91,7 @@ class Application(models.Model):
     class Meta:
         unique_together = ['task', 'applicant']
         ordering = ['-created_at']
+
 
 class ChatMessage(models.Model):
     """Chat messages between task creator and applicant"""
@@ -87,6 +107,7 @@ class ChatMessage(models.Model):
     
     def __str__(self):
         return f"{self.sender.username} -> {self.receiver.username}: {self.content[:50]}"
+
 
 class Notification(models.Model):
     NOTIFICATION_TYPES = [
@@ -117,6 +138,7 @@ class Notification(models.Model):
     def __str__(self):
         return f"{self.title} for {self.recipient.username}"
 
+
 class PaymentProof(models.Model):
     """Picture proof of payment for tasks"""
     STATUS_CHOICES = [
@@ -142,6 +164,7 @@ class PaymentProof(models.Model):
     def __str__(self):
         return f"Payment proof for {self.task.title} - {self.amount}"
 
+
 class TaskPaymentEscrow(models.Model):
     """Escrow system for task payments"""
     STATUS_CHOICES = [
@@ -165,6 +188,19 @@ class TaskPaymentEscrow(models.Model):
     
     def __str__(self):
         return f"Escrow for {self.task.title} - {self.amount}"
+    
+    def can_release(self):
+        """Check if escrow can be released"""
+        return self.status == 'funded' and self.task.is_fully_completed()
+    
+    def release(self):
+        """Release escrow to all accepted workers"""
+        if not self.can_release():
+            return False, "Cannot release escrow at this time"
+        
+        # This method will be called by the view
+        return True, "Ready to release"
+
 
 class EscrowRelease(models.Model):
     """Track how escrow is distributed among multiple workers"""
@@ -177,3 +213,6 @@ class EscrowRelease(models.Model):
     
     def __str__(self):
         return f"Release for {self.escrow.task.title} - ₦{self.amount}"
+    
+    class Meta:
+        ordering = ['-released_at']
