@@ -248,6 +248,13 @@ class TaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Check if task has a completion key
+        if not task.completion_key:
+            return Response(
+                {'error': 'This task does not have a completion key set. Please contact support.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         # Verify completion key (case-insensitive)
         if task.completion_key.lower() != completion_key.lower():
             return Response(
@@ -357,7 +364,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                 # Credit worker's wallet
                 worker_wallet.credit(amount_per_worker)
                 
-                # Create transaction record
+                # Create transaction record with CREDIT type
                 tx_ref = f"ESCROW_RELEASE_{task.id}_{app.id}_{uuid.uuid4().hex[:8].upper()}"
                 Transaction.objects.create(
                     wallet=worker_wallet,
@@ -365,7 +372,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                     transaction_type='credit',
                     status='completed',
                     reference=tx_ref,
-                    description=f"Payment for task: {task.title}",
+                    description=f"Payment received for task: {task.title}",
                     metadata={
                         'task_id': task.id,
                         'task_title': task.title,
